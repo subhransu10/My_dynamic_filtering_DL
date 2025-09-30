@@ -1,0 +1,50 @@
+# ==== PATHS ====
+DATASET_ROOT: "D:/Subhransu workspace/Dataset/my_kitti_dataset/dataset"
+SEQUENCES_TRAIN: ["00","01","02","03","04","05","06","07","09","10"]
+SEQUENCE_VAL: "08"
+
+# ==== IO / batching ====
+num_workers: 0
+batch_size: 2              # reduce a bit if you raise points
+max_points: 32768
+use_prev: true
+n_prev: 2                  
+max_prev_points: 16384
+
+# ==== training ====
+epochs: 40
+lr: 1.0e-3
+weight_decay: 1.0e-4
+class_weight_moving: 10.0
+focal_gamma: 2.0
+eval_threshold: 0.50
+
+# LR schedule + warmup
+scheduler: "cosine"        # ["cosine", "none"]
+warmup_epochs: 1
+
+# EMA
+ema_enable: true
+ema_decay: 0.999
+
+# Per-range loss weighting (soft boost for far points)
+range_weight:
+  enable: true
+  alpha: 0.5              # up to +50% weight for far pts
+  r0: 20.0                # start boosting after 20m
+  r1: 50.0                # reach max boost at 50m+
+
+# ==== augmentation ====
+aug:
+  jitter_std: 0.01
+  flip_prob: 0.5
+  rot_limit_deg: 5.0
+
+# ==== logging ====
+log_interval: 50
+val_interval_epochs: 1
+
+# ==== misc ====
+device: "cuda"
+random_seed: 42
+semantic_kitti_yaml: null

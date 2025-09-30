@@ -1,0 +1,6 @@
+numpy
+pyyaml
+torch>=2.0
+torchvision
+scipy
+tqdm
