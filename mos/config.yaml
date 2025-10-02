@@ -4,24 +4,31 @@ SEQUENCES_TRAIN: ["00","01","02","03","04","05","06","07","09","10"]
 SEQUENCE_VAL: "08"
 
 # ==== IO / batching ====
-num_workers: 0
-batch_size: 2              # reduce a bit if you raise points
-max_points: 32768
+num_workers: 4
+batch_size: 6              # reduce a bit if you raise points
+max_points: 12288
 use_prev: true
 n_prev: 2                  
-max_prev_points: 16384
+max_prev_points: 6144
 
+#speed knobs
+frame_stride: 3        # use every 3rd frame
+prev_voxel_size: 0.6   # downsample prev before dmin
+dmin_chunk: 4096       # GPU chunk for cdist
 # ==== training ====
 epochs: 40
-lr: 1.0e-3
+bce_burnin_epochs: 2
+lr: 1.0e-4
 weight_decay: 1.0e-4
-class_weight_moving: 10.0
-focal_gamma: 2.0
-eval_threshold: 0.50
-
+class_weight_moving: 8.0
+focal_gamma: 1.0
+eval_threshold: 0.1
+eval_sweep: true
+init_prior)bias: true
+prior_scan_batches: 8
 # LR schedule + warmup
 scheduler: "cosine"        # ["cosine", "none"]
-warmup_epochs: 1
+warmup_epochs: 3
 
 # EMA
 ema_enable: true
