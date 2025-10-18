@@ -1,11 +1,11 @@
 # mos/visualize_preds.py
 from __future__ import annotations
-import os, argparse
+import os, argparse, time
 import numpy as np
 import torch
 
 from mos.train import load_cfg, make_datasets
-from mos.model import TinyPointNetSeg
+from mos.model import build model
 
 try:
     import open3d as o3d
@@ -14,16 +14,21 @@ except Exception:
     HAS_O3D = False
 
 
+# ------------------------ coloring helpers ------------------------
+
 def colors_from_prob(probs: np.ndarray) -> np.ndarray:
+    """Blue→Red ramp. Red = high prob."""
     p = np.clip(probs.reshape(-1, 1), 0.0, 1.0).astype(np.float32)
+    # R = p, G = small for contrast, B = (1-p)
     return np.concatenate([p, 0.2 * (1.0 - p), (1.0 - p)], axis=1)
 
 def colors_pred_only(xyz: np.ndarray, pred_moving: np.ndarray) -> np.ndarray:
     col = np.full((xyz.shape[0], 3), 0.55, dtype=np.float32)
-    col[pred_moving] = np.array([1.0, 0.15, 0.15], dtype=np.float32)
+    col[pred_moving] = np.array([1.0, 0.15, 0.15], dtype=np.float32)  # red
     return col
 
 def colors_with_gt(xyz: np.ndarray, gt_moving: np.ndarray, pred_moving: np.ndarray) -> np.ndarray:
+    # TN = gray, TP = red, FP = yellow, FN = cyan
     col = np.full((xyz.shape[0], 3), [0.35, 0.35, 0.35], dtype=np.float32)
     tp =  pred_moving &  gt_moving
     fp =  pred_moving & ~gt_moving
@@ -32,6 +37,9 @@ def colors_with_gt(xyz: np.ndarray, gt_moving: np.ndarray, pred_moving: np.ndarr
     col[fp] = [1.00, 0.90, 0.20]
     col[fn] = [0.10, 0.85, 1.00]
     return col
+
+
+# ------------------------ io helpers ------------------------
 
 def save_ply(path: str, xyz: np.ndarray, rgb01: np.ndarray):
     rgb255 = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
@@ -43,6 +51,9 @@ def save_ply(path: str, xyz: np.ndarray, rgb01: np.ndarray):
         f.write("end_header\n")
         for (x, y, z), (r, g, b) in zip(xyz, rgb255):
             f.write(f"{x:.6f} {y:.6f} {z:.6f} {r:d} {g:d} {b:d}\n")
+
+
+# ------------------------ dataset helpers ------------------------
 
 def collect_seq_items(ds_val, seq: str, max_frames: int | None):
     idxs = [i for i, (s, _) in enumerate(ds_val.items) if s == seq]
@@ -58,6 +69,9 @@ def apply_crop(xyz: np.ndarray, keep_front: bool, rmax: float | None) -> np.ndar
         m &= (np.linalg.norm(xyz[:, :2], axis=1) <= float(rmax))
     return m
 
+
+# ------------------------ viewer ------------------------
+
 def run_o3d_viewer(
     items,
     model,
@@ -72,6 +86,7 @@ def run_o3d_viewer(
     point_size: float,
     crop_front: bool,
     rmax: float | None,
+    ckpt_path: str | None = None,
 ):
     assert HAS_O3D, "Open3D not available"
 
@@ -109,6 +124,15 @@ def run_o3d_viewer(
         out[idx[keep]] = True
         return out
 
+    @torch.no_grad()
+    def forward_probs(points_np: np.ndarray) -> np.ndarray:
+        pts = torch.from_numpy(points_np).to(device)
+        pts = torch.nan_to_num(pts, nan=0.0, posinf=1e6, neginf=-1e6)
+        bidx = torch.zeros((len(pts),), dtype=torch.long, device=device)
+        # our model returns logits by default
+        logits = model(pts, bidx)
+        return torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+
     def render(i: int):
         nonlocal geom
         item = items[i]
@@ -116,11 +140,8 @@ def run_o3d_viewer(
         crop_mask = apply_crop(full_xyz, crop_front, rmax)
         xyz = full_xyz[crop_mask]
 
-        with torch.no_grad():
-            pts  = torch.from_numpy(item["points"]).to(device)
-            bidx = torch.zeros((len(pts),), dtype=torch.long, device=device)
-            probs_full = torch.sigmoid(model(pts, bidx)).detach().cpu().numpy().reshape(-1)
-            probs = probs_full[crop_mask]
+        probs_full = forward_probs(item["points"])
+        probs = probs_full[crop_mask]
 
         if state["prob_mode"]:
             col = colors_from_prob(probs)
@@ -129,8 +150,7 @@ def run_o3d_viewer(
             if state["do_cluster"]:
                 pred = cluster_mask(xyz, pred)
             if state["show_gt"]:
-                gt_full = (item["label"] >= 0.5)
-                gt = gt_full[crop_mask]
+                gt = (item["label"] >= 0.5)[crop_mask]
                 col = colors_with_gt(xyz, gt, pred)
                 # per-frame stats (cropped)
                 tp = int((pred & gt).sum()); fp = int((pred & ~gt).sum())
@@ -159,6 +179,23 @@ def run_o3d_viewer(
         print(f"[view] {title} | thresh={state['thresh']:.2f} | GT={state['show_gt']} | cluster={state['do_cluster']} ({state['eps']},{state['min_pts']}) | prob_mode={state['prob_mode']}")
         return title
 
+    # ---------- hot reload ----------
+    def reload_ckpt(_):
+        if not ckpt_path:
+            print("[reload] No --ckpt provided.")
+            return True
+        try:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            sd = ckpt.get("model", ckpt)
+            model.load_state_dict(sd, strict=False)
+            model.eval()
+            print(f"[reload] reloaded {ckpt_path} (ep={ckpt.get('ep','?')})")
+            render(state["i"])
+        except Exception as e:
+            print(f"[reload] failed: {e}")
+        return True
+
+    # ---------- key bindings ----------
     def go_next(_): state["i"] = (state["i"] + 1) % len(items); render(state["i"]); return True
     def go_prev(_): state["i"] = (state["i"] - 1) % len(items); render(state["i"]); return True
     def toggle_gt(_): state["show_gt"] = not state["show_gt"]; render(state["i"]); return True
@@ -181,12 +218,15 @@ def run_o3d_viewer(
     vis.register_key_callback(ord("["), dec_thresh)
     vis.register_key_callback(ord("P"), toggle_prob)
     vis.register_key_callback(ord("S"), save_png)
+    vis.register_key_callback(ord("R"), reload_ckpt)
 
     render(0)
-    print("Keys: N=next, B=prev, G=toggle GT, C=toggle clusters, [ / ] threshold, P=prob heatmap, S=screenshot, Q/ESC=quit")
+    print("Keys: N=next, B=prev, G=toggle GT, C=toggle clusters, [ / ] threshold, P=prob heatmap, S=screenshot, R=reload ckpt, Q/ESC=quit")
     vis.run()
     vis.destroy_window()
 
+
+# ------------------------ main ------------------------
 
 def main():
     ap = argparse.ArgumentParser()
@@ -218,39 +258,21 @@ def main():
     if not items:
         print(f"[viz] no frames for sequence {seq}"); return
 
-    in_ch = 5 if cfg["use_prev"] else 4
-    model = TinyPointNetSeg(in_channels=in_ch).to(device)
+    # build the same model as training
+    model = build_model(cfg).to(device)
     ckpt = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(ckpt["model"]); model.eval()
+    state = ckpt.get("model", ckpt)
+
+    # forgiving load for shape-safe init (in case you change channels/ranges)
+    msd = model.state_dict()
+    loadable = {k: v for k, v in state.items() if k in msd and msd[k].shape == v.shape}
+    miss = len(msd) - len(loadable)
+    model.load_state_dict({**msd, **loadable}, strict=False)
+    if miss:
+        print(f"[viz] forgiving load: used {len(loadable)} / {len(msd)} tensors (missing {miss})")
+    model.eval()
 
     thresh = float(args.thresh if args.thresh is not None else cfg.get("eval_threshold", 0.5))
     print(f"[viz] seq={seq} frames={len(items)} thresh={thresh:.2f} HAS_O3D={HAS_O3D}")
 
-    if HAS_O3D and args.save_ply_dir is None:
-        run_o3d_viewer(
-            items, model, device, thresh,
-            args.show_gt, args.cluster, args.eps, args.min_pts,
-            args.save_png_dir, args.prob, args.point_size,
-            args.crop_front, args.rmax
-        )
-    else:
-        out_dir = args.save_ply_dir or "viz_out"
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"[viz] writing colored PLYs → {out_dir}")
-        with torch.no_grad():
-            for k, item in enumerate(items, 1):
-                xyz = item["points"][:, :3].astype(np.float32)
-                pts  = torch.from_numpy(item["points"]).to(device)
-                bidx = torch.zeros((len(pts),), dtype=torch.long, device=device)
-                probs = torch.sigmoid(model(pts, bidx)).cpu().numpy().reshape(-1)
-                if args.prob:
-                    col = colors_from_prob(probs)
-                else:
-                    pred = (probs >= thresh)
-                    col = colors_with_gt(xyz, item["label"] >= 0.5, pred) if args.show_gt else colors_pred_only(xyz, pred)
-                name = f"{item['seq']}_{item['frame']}_th{int(thresh*100):02d}.ply"
-                save_ply(os.path.join(out_dir, name), xyz, col)
-                if k % 10 == 0 or k == len(items): print(f"  saved {k}/{len(items)}")
-
-if __name__ == "__main__":
-    main()
+   

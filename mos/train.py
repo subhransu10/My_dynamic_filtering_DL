@@ -1,16 +1,38 @@
 # mos/train.py
 from __future__ import annotations
-import os, math, yaml, warnings
+import math, yaml, warnings
 import torch
 import torch.nn as nn
+import os, sys
+from torch._dynamo import config as dynamo_config
+
+# Try to disable Inductor's CPU C++ path (which looks for cl.exe on Windows)
+try:
+    import torch._inductor.config as inductor_config
+    inductor_config.cpp.enable = False
+except Exception:
+    pass
+
+# Also disable via env (PyTorch checks this)
+os.environ.setdefault("TORCHINDUCTOR_DISABLE_CPP", "1")
+
+# Avoid graph breaks from .item() in compiled graphs
+dynamo_config.capture_scalar_outputs = True
+
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .dataset import SemanticKITTIMOS, mos_collate
-from .model import TinyPointNetSeg
+from .model import build_model, TinyPointNetSeg  # TinyPointNetSeg kept for bias init scan
 from .losses import WeightedFocalBCE
 from .metrics import binary_stats
 from .utils import set_seed
+
+# Optional ComboLoss (if you add it later)
+try:
+    from .losses import ComboLoss  # type: ignore
+except Exception:
+    ComboLoss = None  # pyright: ignore[reportConstantRedefinition]
 
 
 def load_cfg(path: str):
@@ -39,8 +61,7 @@ def make_datasets(cfg):
 class EMA:
     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
         self.decay = decay
-        self.shadow = {}
-        self.backup = {}
+        self.shadow, self.backup = {}, {}
         with torch.no_grad():
             for name, p in model.named_parameters():
                 if p.requires_grad:
@@ -155,8 +176,40 @@ def try_resume(model, optim, cfg, device, resume_path: str | None, resume_last: 
     return start_epoch, best_f1
 
 
-# ----------------- loss plumbing -----------------
-def compute_loss(
+# ----------------- prediction stats (safe for huge tensors) -----------------
+@torch.no_grad()
+def pred_stats(logits: torch.Tensor, max_elements: int = 2_000_000):
+    s = torch.sigmoid(logits.detach()).view(-1).to(dtype=torch.float32)
+    n = s.numel()
+    if n == 0:
+        return dict(mean=0.0, min=0.0, max=0.0, p010=0.0, p900=0.0)
+    if n > max_elements:
+        idx = torch.randperm(n, device=s.device)[:max_elements]
+        s = s.index_select(0, idx)
+    out = dict(
+        mean=float(s.mean().cpu()),
+        min=float(s.min().cpu()),
+        max=float(s.max().cpu()),
+    )
+    try:
+        out["p010"] = float(torch.quantile(s, 0.10).cpu())
+        out["p900"] = float(torch.quantile(s, 0.90).cpu())
+    except RuntimeError:
+        m = min(int(256_000), s.numel())
+        if s.numel() > m:
+            idx = torch.randperm(s.numel(), device=s.device)[:m]
+            t = s.index_select(0, idx)
+        else:
+            t = s
+        k10 = max(1, int(0.10 * (t.numel() - 1)))
+        k90 = max(1, int(0.90 * (t.numel() - 1)))
+        out["p010"] = float(t.kthvalue(k10).values.cpu())
+        out["p900"] = float(t.kthvalue(k90).values.cpu())
+    return out
+
+
+# ----------------- simple BCE/focal loss -----------------
+def compute_loss_basic(
     logits: torch.Tensor,
     targets: torch.Tensor,
     sample_w: torch.Tensor,
@@ -170,38 +223,57 @@ def compute_loss(
         per = per.to(torch.float32)
         loss = (per * sample_w).mean()
     else:
+        assert focal_loss is not None
         loss = focal_loss(logits, targets, sample_weight=sample_w)
     return loss
 
 
-# ----------------- prediction stats -----------------
-@torch.no_grad()
-def pred_stats(logits: torch.Tensor):
-    s = torch.sigmoid(logits)
-    return dict(
-        mean=float(s.mean().cpu()),
-        min=float(s.min().cpu()),
-        max=float(s.max().cpu()),
-        p001=float(torch.quantile(s, 0.01).cpu()),
-        p010=float(torch.quantile(s, 0.10).cpu()),
-        p900=float(torch.quantile(s, 0.90).cpu()),
-        p999=float(torch.quantile(s, 0.99).cpu()),
-    )
+# ----------------- optional combo loss path -----------------
+def compute_loss_combo(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    sample_w: torch.Tensor,
+    focal_loss: WeightedFocalBCE | None,
+    bce_loss_none: nn.BCEWithLogitsLoss | None,
+    use_bce: bool,
+    combo_loss: "ComboLoss | None",
+    aux_logits: list[torch.Tensor] | None,
+) -> torch.Tensor:
+    # If combo not provided, fall back to basic
+    if combo_loss is None:
+        return compute_loss_basic(logits, targets, sample_w, focal_loss, bce_loss_none, use_bce)
+
+    # Otherwise: combo loss branch
+    sample_w = sample_w.to(dtype=torch.float32)
+    if use_bce:
+        per = bce_loss_none(logits, targets)
+        per = per.to(torch.float32)
+        return (per * sample_w).mean()
+
+    core = combo_loss(logits, targets, aux_logits=aux_logits or [])
+    if focal_loss is not None:
+        fb = focal_loss(logits, targets, sample_weight=sample_w)
+        core = core + 0.1 * fb
+    return core
 
 
 def train_one_epoch(
-    model,
-    loader,
-    optim,
-    device,
-    cfg,
+    *,
+    model: nn.Module,
+    loader: DataLoader,
+    optim: torch.optim.Optimizer,
+    device: torch.device,
+    cfg: dict,
     ema: EMA | None,
     scaler: torch.amp.GradScaler | None,
     use_amp: bool,
-    focal_loss: WeightedFocalBCE,
-    bce_loss_none: nn.BCEWithLogitsLoss,
+    focal_loss: WeightedFocalBCE | None,
+    bce_loss_none: nn.BCEWithLogitsLoss | None,
     use_bce: bool,
-    log_interval=50,
+    combo_loss: "ComboLoss | None",
+    log_interval: int,
+    clip_model: nn.Module | None = None,  # clip grads on this module (prefer raw_model)
+    ema_model: nn.Module | None = None,   # update EMA from this module (prefer raw_model)
 ):
     model.train()
     running = 0.0
@@ -217,31 +289,42 @@ def train_one_epoch(
         optim.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type="cuda", enabled=(use_amp and device.type == "cuda")):
-            logits = model(pts, bidx).reshape(-1)
-            loss = compute_loss(
+            # Support both tensor and dict outputs from the model
+            out = model(pts, bidx)
+            if isinstance(out, dict):
+                logits = out["logits"].reshape(-1)
+                aux = [a.reshape(-1) for a in out.get("aux", [])]
+            else:
+                logits = out.reshape(-1)
+                aux = []
+
+            loss = compute_loss_combo(
                 logits, y, sample_w,
                 focal_loss=focal_loss,
                 bce_loss_none=bce_loss_none,
                 use_bce=use_bce,
+                combo_loss=combo_loss,
+                aux_logits=aux,
             )
 
         if not torch.isfinite(loss):
             print("  (warn) non-finite loss, skipping step")
             continue
 
+        to_clip = clip_model if clip_model is not None else model
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(to_clip.parameters(), max_norm=1.0)
             scaler.step(optim)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(to_clip.parameters(), max_norm=1.0)
             optim.step()
 
         if ema is not None:
-            ema.update(model)
+            ema.update(ema_model if ema_model is not None else to_clip)
 
         running += float(loss.detach().cpu())
         n += 1
@@ -265,13 +348,13 @@ def evaluate(model, loader, device, fixed_thresh: float = 0.5, do_sweep: bool = 
         pts = batch["points"].to(device)
         y   = batch["label"].to(device)
         bidx = batch["batch_idx"].to(device)
-        logits = model(pts, bidx).reshape(-1)
-        all_logits.append(logits.cpu())
+        out = model(pts, bidx)
+        logits = out["logits"].reshape(-1) if isinstance(out, dict) else out.reshape(-1)
+        all_logits.append(logits.detach().cpu())
         all_y.append(y.cpu())
     logits = torch.cat(all_logits, 0)
     y = torch.cat(all_y, 0)
 
-    # fixed-threshold metrics
     s_fixed = binary_stats(logits, y, thresh=fixed_thresh)
     prec_f = s_fixed["tp"] / (s_fixed["tp"] + s_fixed["fp"] + 1e-8)
     rec_f  = s_fixed["tp"] / (s_fixed["tp"] + s_fixed["fn"] + 1e-8)
@@ -281,7 +364,6 @@ def evaluate(model, loader, device, fixed_thresh: float = 0.5, do_sweep: bool = 
     best = dict(thresh=fixed_thresh, precision=prec_f, recall=rec_f, f1=f1_f, iou_moving=iou_f)
 
     if do_sweep:
-        # try a grid of thresholds
         ths = torch.linspace(0.01, 0.90, steps=30)
         best_f1 = -1.0
         for t in ths:
@@ -314,17 +396,14 @@ def save_checkpoint(out_dir: str, fname: str, payload: dict):
 def init_head_bias_from_prior(model: nn.Module, loader: DataLoader, device, max_batches: int = 8):
     """
     Estimate P(y=1) from a few batches and set final layer bias to logit(P).
-    Works if model has attribute .head with last Linear out_features=1.
+    Works if model has any Linear with out_features=1 in its heads.
     """
-    # find last linear with out_features=1
     last_lin = None
-    if hasattr(model, "head") and isinstance(model.head, nn.Sequential):
-        for m in reversed(model.head):
-            if isinstance(m, nn.Linear) and m.out_features == 1:
-                last_lin = m
-                break
+    for m in model.modules():
+        if isinstance(m, nn.Linear) and getattr(m, "out_features", None) == 1:
+            last_lin = m
     if last_lin is None or last_lin.bias is None:
-        return  # nothing to do
+        return
 
     total = 0
     pos = 0.0
@@ -366,18 +445,32 @@ def main():
         prop = torch.cuda.get_device_properties(device)
         print(f"[device] name: {prop.name}")
 
-    # model
-    in_ch = 6 if cfg.get("use_prev", True) else 5
-    base_model = TinyPointNetSeg(in_channels=in_ch)
+    # ---------------- model ----------------
+    raw_model = build_model(cfg).to(device)  # always keep an uncompiled base model
+
+    # Choose a safe backend for Windows (no Triton needed), and allow override via cfg.
+    compile_backend = str(cfg.get("compile_backend", "auto")).lower()
+    backend = None
+    if compile_backend == "auto":
+        # On Windows, avoid inductor (needs Triton). Use aot_eager instead.
+        backend = "aot_eager" if os.name == "nt" else None  # None => default inductor on Linux
+    else:
+        backend = compile_backend  # e.g., "eager", "aot_eager", or "inductor"
+
+    model_train = raw_model
     if (device.type == "cuda") and (not args.no_compile):
         try:
-            base_model = torch.compile(base_model)
-            print("[compile] torch.compile enabled")
+            if backend is None:
+                model_train = torch.compile(raw_model)  # default (inductor) on Linux
+                print("[compile] torch.compile enabled (backend=inductor)")
+            else:
+                model_train = torch.compile(raw_model, backend=backend)
+                print(f"[compile] torch.compile enabled (backend={backend})")
         except Exception as e:
-            print(f"[compile] disabled ({e})")
-    model = base_model.to(device)
+            print(f"[compile] disabled (fallback due to: {e})")
+            model_train = raw_model
 
-    # losses
+    # ------------- losses/optim/data -------------
     focal_loss = WeightedFocalBCE(
         pos_weight=cfg["class_weight_moving"],
         gamma=cfg["focal_gamma"],
@@ -386,11 +479,17 @@ def main():
     bce_pos_weight = torch.tensor([cfg["class_weight_moving"]], device=device, dtype=torch.float32)
     bce_loss_none = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight, reduction="none")
 
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    scheduler, _ = build_scheduler(optim, cfg)
-    ema = EMA(model, decay=float(cfg.get("ema_decay", 0.999))) if cfg.get("ema_enable", False) else None
+    # Optional: instantiate ComboLoss only if available + enabled in cfg
+    combo_loss = None
+    if ComboLoss is not None and cfg.get("combo_loss", {}).get("enable", False):
+        cl = cfg["combo_loss"]
+        combo_loss = ComboLoss(**{k: v for k, v in cl.items() if k != "enable"})  # type: ignore
+        print("[loss] Using ComboLoss with params:", cl)
 
-    # data
+    optim = torch.optim.AdamW(raw_model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scheduler, _ = build_scheduler(optim, cfg)
+    ema = EMA(raw_model, decay=float(cfg.get("ema_decay", 0.999))) if cfg.get("ema_enable", False) else None
+
     ds_train, ds_val = make_datasets(cfg)
     dl_train = DataLoader(
         ds_train, batch_size=cfg["batch_size"], shuffle=True,
@@ -401,19 +500,16 @@ def main():
         num_workers=cfg["num_workers"], collate_fn=mos_collate, drop_last=False,
     )
 
-    # optional: initialize final bias from label prior to avoid "all zeros" at start
     if cfg.get("init_prior_bias", True):
-        init_head_bias_from_prior(model, dl_train, device, max_batches=int(cfg.get("prior_scan_batches", 8)))
+        init_head_bias_from_prior(raw_model, dl_train, device, max_batches=int(cfg.get("prior_scan_batches", 8)))
 
-    # resume
     start_epoch, best_f1 = try_resume(
-        model, optim, cfg, device,
+        raw_model, optim, cfg, device,
         resume_path=args.resume_path,
         resume_last=args.resume_last,
         fresh=args.fresh,
     )
 
-    # AMP
     use_amp = (device.type == "cuda") and (not args.no_amp)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -424,10 +520,10 @@ def main():
 
     for ep in range(start_epoch, epochs + 1):
         print(f"\nEpoch {ep}/{epochs}")
-        use_bce = ep <= burnin_epochs  # BCE burn-in, then focal
+        use_bce = ep <= burnin_epochs
 
         train_one_epoch(
-            model=model,
+            model=model_train,          # compiled wrapper (or raw_model if compile disabled)
             loader=dl_train,
             optim=optim,
             device=device,
@@ -438,23 +534,26 @@ def main():
             focal_loss=focal_loss,
             bce_loss_none=bce_loss_none,
             use_bce=use_bce,
+            combo_loss=combo_loss,
             log_interval=cfg["log_interval"],
+            clip_model=raw_model,       # clip on raw_model params
+            ema_model=raw_model,        # update EMA from raw_model params
         )
 
         if scheduler is not None:
             scheduler.step()
 
-        # ---- VALIDATION ----
         if ep % cfg["val_interval_epochs"] == 0:
+            # Evaluate directly on the RAW (uncompiled) model.
             if ema is not None:
-                ema.apply_to(model)
-            metrics = evaluate(model, dl_val, device, fixed_thresh=eval_thresh, do_sweep=sweep_eval)
-            if ema is not None:
-                ema.restore(model)
+                ema.apply_to(raw_model)
 
-            fx = metrics["fixed"]
-            bs = metrics["best"]
-            ps = metrics["pred_summary"]
+            metrics = evaluate(raw_model, dl_val, device, fixed_thresh=eval_thresh, do_sweep=sweep_eval)
+
+            if ema is not None:
+                ema.restore(raw_model)
+
+            fx = metrics["fixed"]; bs = metrics["best"]; ps = metrics["pred_summary"]
             print(
                 f"Val (fixed t={fx['thresh']:.2f}): P={fx['precision']:.3f} R={fx['recall']:.3f} "
                 f"F1={fx['f1']:.3f} IoU={fx['iou_moving']:.3f}"
@@ -469,29 +568,25 @@ def main():
                 f"p90={ps['p900']:.4f} max={ps['max']:.4f}  (val pos_rate≈{metrics['pos_rate']:.4f})"
             )
 
-            # save "last" (EMA weights if enabled)
-            state_to_save = model.state_dict()
-            if ema is not None:
-                ema.apply_to(model)
-                state_to_save = model.state_dict()
-                ema.restore(model)
-
+            # Save checkpoints from raw_model weights
+            state_to_save = raw_model.state_dict()
             save_checkpoint(
                 "checkpoints",
                 "mos_last.pt",
-                {"ep": ep, "model": state_to_save, "optim": (optim.state_dict() if not args.fresh else {}), "cfg": cfg, "best_f1": best_f1},
+                {"ep": ep, "model": state_to_save, "optim": (optim.state_dict() if not args.fresh else {}),
+                 "cfg": cfg, "best_f1": best_f1},
             )
 
-            # save "best" by F1 (use swept F1 if enabled, else fixed)
             curr_f1 = bs["f1"] if sweep_eval else fx["f1"]
             if curr_f1 > best_f1:
                 best_f1 = curr_f1
                 save_checkpoint(
                     "checkpoints",
                     "mos_best.pt",
-                    {"ep": ep, "model": state_to_save, "optim": (optim.state_dict() if not args.fresh else {}), "cfg": cfg, "best_f1": best_f1},
+                    {"ep": ep, "model": state_to_save, "optim": (optim.state_dict() if not args.fresh else {}),
+                     "cfg": cfg, "best_f1": best_f1},
                 )
-#end of the training file
+
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", message="index_reduce\\(\\) is in beta", category=UserWarning)

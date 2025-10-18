@@ -8,22 +8,22 @@ num_workers: 4
 batch_size: 6              # reduce a bit if you raise points
 max_points: 12288
 use_prev: true
-n_prev: 2                  
-max_prev_points: 6144
+n_prev: 3                  
+max_prev_points: 80000
 
 #speed knobs
 frame_stride: 3        # use every 3rd frame
 prev_voxel_size: 0.6   # downsample prev before dmin
 dmin_chunk: 4096       # GPU chunk for cdist
 # ==== training ====
-epochs: 40
+epochs: 20
 bce_burnin_epochs: 2
 lr: 1.0e-4
 weight_decay: 1.0e-4
-class_weight_moving: 8.0
-focal_gamma: 1.0
-eval_threshold: 0.1
-eval_sweep: true
+class_weight_moving: 300
+focal_gamma: 2.0
+eval_threshold: 0.81
+eval_sweep: false
 init_prior)bias: true
 prior_scan_batches: 8
 # LR schedule + warmup
@@ -55,3 +55,19 @@ val_interval_epochs: 1
 device: "cuda"
 random_seed: 42
 semantic_kitti_yaml: null
+
+# --- model switch ---
+model_name: "bev_unet"   # "tiny_mlp" (old) or "me_unet"
+
+# BEV grid config (meters)
+bev:
+  voxel_size_xy: 0.20     # BEV cell size (x/y), m
+  x_min: -50.0
+  x_max:  50.0
+  y_min: -50.0
+  y_max:  50.0
+  base_ch: 32             # BEV UNet width (try 32 → 48 → 64)
+
+# Point feature layout your dataset provides
+# points = [x,y,z,intensity,range,(optional norm_dmin when use_prev=True)]
+use_prev: true            # if true, we assume a 6th channel: norm_dmin
