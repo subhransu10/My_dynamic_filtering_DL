@@ -1,22 +1,17 @@
 # mos/train.py
 from __future__ import annotations
-import math, yaml, warnings
+import math, yaml, warnings, os, time
 import torch
 import torch.nn as nn
-import os, sys
+import torch.nn.functional as F
 from torch._dynamo import config as dynamo_config
 
-# Try to disable Inductor's CPU C++ path (which looks for cl.exe on Windows)
 try:
     import torch._inductor.config as inductor_config
     inductor_config.cpp.enable = False
 except Exception:
     pass
-
-# Also disable via env (PyTorch checks this)
 os.environ.setdefault("TORCHINDUCTOR_DISABLE_CPP", "1")
-
-# Avoid graph breaks from .item() in compiled graphs
 dynamo_config.capture_scalar_outputs = True
 
 from torch.utils.data import DataLoader
@@ -24,11 +19,11 @@ from tqdm import tqdm
 
 from .dataset import SemanticKITTIMOS, mos_collate
 from .model import build_model, TinyPointNetSeg  # TinyPointNetSeg kept for bias init scan
-from .losses import WeightedFocalBCE
+from .losses import WeightedFocalBCE, ComboLoss
 from .metrics import binary_stats
 from .utils import set_seed
 
-# Optional ComboLoss (if you add it later)
+# Optional ComboLoss (kept compatible)
 try:
     from .losses import ComboLoss  # type: ignore
 except Exception:
@@ -36,25 +31,8 @@ except Exception:
 
 
 def load_cfg(path: str):
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return yaml.safe_load(f)
-
-
-def make_datasets(cfg):
-    root = cfg["DATASET_ROOT"]
-    train_seqs = cfg["SEQUENCES_TRAIN"]
-    val_seq = [cfg["SEQUENCE_VAL"]]
-    common = dict(
-        root=root,
-        semantic_kitti_yaml=cfg.get("semantic_kitti_yaml", None),
-        max_points=cfg["max_points"],
-        use_prev=cfg["use_prev"],
-        n_prev=int(cfg.get("n_prev", 1)),
-        max_prev_points=cfg["max_prev_points"],
-    )
-    ds_train = SemanticKITTIMOS(sequences=train_seqs, aug=cfg["aug"], split="train", **common)
-    ds_val   = SemanticKITTIMOS(sequences=val_seq,   aug=None,       split="val",   **common)
-    return ds_train, ds_val
 
 
 # ---------------------- EMA ----------------------
@@ -102,11 +80,52 @@ def build_scheduler(optimizer, cfg):
         if warmup > 0 and e < warmup:
             return float(e + 1) / float(warmup)
         T = max(1, total_epochs - warmup)
-        t = min(T, e - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * t / T))
+        t = max(0, min(T, e - warmup))
+        return 0.5 * (1.0 + math.cos(math.pi * t / max(T, 1)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     return scheduler, lr_lambda
+
+
+# ----------------- datasets -----------------
+def make_datasets(cfg):
+    root = cfg["DATASET_ROOT"]
+    train_seqs = cfg["SEQUENCES_TRAIN"]
+    val_seq = [cfg["SEQUENCE_VAL"]]
+    common = dict(
+        root=root,
+        semantic_kitti_yaml=cfg.get("semantic_kitti_yaml", None),
+        max_points=cfg["max_points"],
+        use_prev=cfg["use_prev"],
+        n_prev=int(cfg.get("n_prev", 1)),
+        max_prev_points=cfg["max_prev_points"],
+    )
+    # NOTE: no temporal clips passed here; single-frame+prev only.
+    ds_train = SemanticKITTIMOS(sequences=train_seqs, aug=cfg["aug"], split="train", **common)
+    ds_val   = SemanticKITTIMOS(sequences=val_seq,   aug=None,       split="val",   **common)
+    return ds_train, ds_val
+
+
+# --------- Simple RAM cache wrapper (optional) ---------
+class CachedDataset(torch.utils.data.Dataset):
+    """
+    Tiny RAM cache around a Dataset. Greatly reduces Windows disk stalls.
+    """
+    def __init__(self, base_ds, max_items=None):
+        self.base = base_ds
+        self.cache = {}
+        self.keys = []
+        self.max_items = max_items  # None = unlimited (careful)
+    def __len__(self): return len(self.base)
+    def __getitem__(self, i):
+        if i in self.cache:
+            return self.cache[i]
+        item = self.base[i]
+        self.cache[i] = item
+        self.keys.append(i)
+        if self.max_items is not None and len(self.keys) > self.max_items:
+            k = self.keys.pop(0); self.cache.pop(k, None)
+        return item
 
 
 # ----------------- range-based sample weights -----------------
@@ -146,7 +165,6 @@ def load_forgiving(model: torch.nn.Module, state_dict: dict) -> tuple[int, int]:
 def try_resume(model, optim, cfg, device, resume_path: str | None, resume_last: bool, fresh: bool):
     start_epoch = 1
     best_f1 = -1.0
-
     path = None
     if resume_path:
         path = resume_path
@@ -208,6 +226,36 @@ def pred_stats(logits: torch.Tensor, max_elements: int = 2_000_000):
     return out
 
 
+# ----------------- precision-target sweep -----------------
+def sweep_for_precision(logits: torch.Tensor, y: torch.Tensor, target_p: float = 0.80):
+    ths = torch.linspace(0.05, 0.99, steps=60)
+    best = dict(thresh=None, precision=0.0, recall=0.0, f1=0.0)
+    for t in ths:
+        s = binary_stats(logits, y, thresh=float(t))
+        p = s["tp"] / (s["tp"] + s["fp"] + 1e-8)
+        r = s["tp"] / (s["tp"] + s["fn"] + 1e-8)
+        f1 = 2 * p * r / (p + r + 1e-8)
+        if p >= target_p:
+            if best["thresh"] is None or f1 > best["f1"]:
+                best = dict(thresh=float(t), precision=p, recall=r, f1=f1)
+    return best
+
+
+# ----------------- temperature scaling (eval-time only) -----------------
+def maybe_load_temperature(device):
+    path = os.path.join("checkpoints", "temp_scale.pt")
+    if os.path.isfile(path):
+        try:
+            payload = torch.load(path, map_location=device)
+            T = float(payload.get("T", 1.0))
+            if 0.05 <= T <= 10.0:
+                print(f"[calib] applying temperature scaling T={T:.3f} for evaluation")
+                return T
+        except Exception:
+            pass
+    return 1.0
+
+
 # ----------------- simple BCE/focal loss -----------------
 def compute_loss_basic(
     logits: torch.Tensor,
@@ -216,6 +264,7 @@ def compute_loss_basic(
     focal_loss: WeightedFocalBCE | None,
     bce_loss_none: nn.BCEWithLogitsLoss | None,
     use_bce: bool,
+    cfg: dict,                              # <— ADDED
 ) -> torch.Tensor:
     sample_w = sample_w.to(dtype=torch.float32)
     if use_bce:
@@ -224,8 +273,59 @@ def compute_loss_basic(
         loss = (per * sample_w).mean()
     else:
         assert focal_loss is not None
+        # base focal (will be recomputed after hard-neg boosting)
         loss = focal_loss(logits, targets, sample_weight=sample_w)
+
+        # stronger hard-negative mining (percentile-based)
+        hn = cfg.get("hard_neg", {}).get("enable", False)
+        if hn:
+            hn_cfg = cfg["hard_neg"]
+            pct   = float(hn_cfg.get("topk_percent", 2.0)) / 100.0
+            boost = float(hn_cfg.get("boost", 0.75))
+            with torch.no_grad():
+                s = torch.sigmoid(logits.detach())
+                neg = (targets < 0.5)
+                neg_scores = s[neg]
+                if neg_scores.numel() > 0 and pct > 0:
+                    k = max(1, int(pct * neg_scores.numel()))
+                    thresh = torch.topk(neg_scores, k, largest=True).values.min()
+                    mask = neg & (s >= thresh)
+                    sample_w = sample_w + boost * mask.to(sample_w.dtype)
+
+        # focal again with boosted weights
+        loss = focal_loss(logits, targets, sample_weight=sample_w)
+
     return loss
+
+
+# ----------------- self-supervised BEV center loss -----------------
+def selfsup_center_loss(out_dict: dict, cfg) -> torch.Tensor:
+    sscfg = cfg.get("selfsup_center", {})
+    if not sscfg or not sscfg.get("enable", False):
+        # try to put this on the same device as logits if possible
+        device = None
+        if isinstance(out_dict, dict):
+            for v in out_dict.values():
+                if torch.is_tensor(v):
+                    device = v.device
+                    break
+                if isinstance(v, (list, tuple)) and v and torch.is_tensor(v[0]):
+                    device = v[0].device
+                    break
+        return torch.tensor(0.0, device=device if device is not None else "cuda")
+    bev_logits = out_dict.get("bev_logits", None)         # [B,1,H,W]
+    center_logits = out_dict.get("center_logits", None)   # [B,1,H,W]
+    if bev_logits is None or center_logits is None:
+        device = bev_logits.device if bev_logits is not None else "cuda"
+        return torch.tensor(0.0, device=device)
+    with torch.no_grad():
+        p = torch.sigmoid(bev_logits)           # [B,1,H,W]
+        k = int(sscfg.get("target_blur", 7))
+        k = max(3, k | 1)                       # odd kernel
+        target = F.avg_pool2d(p, kernel_size=k, stride=1, padding=k//2)  # soft peaks
+        target = target.clamp(0, 1)
+    loss = F.binary_cross_entropy_with_logits(center_logits, target)
+    return loss * float(sscfg.get("weight", 0.10))
 
 
 # ----------------- optional combo loss path -----------------
@@ -238,22 +338,16 @@ def compute_loss_combo(
     use_bce: bool,
     combo_loss: "ComboLoss | None",
     aux_logits: list[torch.Tensor] | None,
+    cfg: dict,                              # <— ADDED
 ) -> torch.Tensor:
-    # If combo not provided, fall back to basic
     if combo_loss is None:
-        return compute_loss_basic(logits, targets, sample_w, focal_loss, bce_loss_none, use_bce)
-
-    # Otherwise: combo loss branch
+        return compute_loss_basic(logits, targets, sample_w, focal_loss, bce_loss_none, use_bce, cfg)
     sample_w = sample_w.to(dtype=torch.float32)
     if use_bce:
         per = bce_loss_none(logits, targets)
         per = per.to(torch.float32)
         return (per * sample_w).mean()
-
-    core = combo_loss(logits, targets, aux_logits=aux_logits or [])
-    if focal_loss is not None:
-        fb = focal_loss(logits, targets, sample_weight=sample_w)
-        core = core + 0.1 * fb
+    core = combo_loss(logits, targets, aux_logits=aux_logits or [], sample_weight=sample_w)
     return core
 
 
@@ -278,18 +372,26 @@ def train_one_epoch(
     model.train()
     running = 0.0
     n = 0
-    for it, batch in enumerate(tqdm(loader, desc="train")):
-        pts = batch["points"].to(device)
-        y   = batch["label"].to(device)
-        bidx = batch["batch_idx"].to(device)
+
+    do_timers = (str(os.environ.get("MOS_TIMERS", "0")) == "1")
+    io_t = fwd_t = bwd_t = 0.0
+
+    for it, batch in enumerate(tqdm(loader, desc="train", mininterval=1.0, smoothing=0.1)):
+        t0 = time.time() if do_timers else 0.0
+
+        pts  = batch["points"].to(device, non_blocking=True)
+        y    = batch["label"].to(device, non_blocking=True)
+        bidx = batch["batch_idx"].to(device, non_blocking=True)
+
+        if do_timers: io_t += time.time() - t0
 
         pts = torch.nan_to_num(pts, nan=0.0, posinf=1e6, neginf=-1e6)
         sample_w = build_range_weights(pts, cfg)
 
         optim.zero_grad(set_to_none=True)
 
+        t1 = time.time() if do_timers else 0.0
         with torch.amp.autocast(device_type="cuda", enabled=(use_amp and device.type == "cuda")):
-            # Support both tensor and dict outputs from the model
             out = model(pts, bidx)
             if isinstance(out, dict):
                 logits = out["logits"].reshape(-1)
@@ -305,13 +407,21 @@ def train_one_epoch(
                 use_bce=use_bce,
                 combo_loss=combo_loss,
                 aux_logits=aux,
+                cfg=cfg,                     # <— pass cfg
             )
+
+            # self-supervised BEV center loss (NEW)
+            if isinstance(out, dict):
+                loss = loss + selfsup_center_loss(out, cfg)
+
+        if do_timers: fwd_t += time.time() - t1
 
         if not torch.isfinite(loss):
             print("  (warn) non-finite loss, skipping step")
             continue
 
         to_clip = clip_model if clip_model is not None else model
+        t2 = time.time() if do_timers else 0.0
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
@@ -322,12 +432,19 @@ def train_one_epoch(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(to_clip.parameters(), max_norm=1.0)
             optim.step()
+        if do_timers: bwd_t += time.time() - t2
 
         if ema is not None:
             ema.update(ema_model if ema_model is not None else to_clip)
 
         running += float(loss.detach().cpu())
         n += 1
+
+        if do_timers and ((it + 1) % 50 == 0):
+            total = io_t + fwd_t + bwd_t + 1e-9
+            print(f"[timers/50] I/O {io_t:.1f}s ({io_t/total:.0%})  FWD {fwd_t:.1f}s ({fwd_t/total:.0%})  BWD {bwd_t:.1f}s ({bwd_t/total:.0%})")
+            io_t = fwd_t = bwd_t = 0.0
+
         if (it + 1) % log_interval == 0:
             with torch.no_grad():
                 ppos = (y > 0.5).float().mean().item()
@@ -338,20 +455,44 @@ def train_one_epoch(
             running, n = 0.0, 0
 
 
-# ----------------- evaluation (with threshold sweep) -----------------
+# ----------------- evaluation -----------------
 @torch.no_grad()
-def evaluate(model, loader, device, fixed_thresh: float = 0.5, do_sweep: bool = True):
+def evaluate(model, loader, device, cfg, fixed_thresh: float = 0.5, do_sweep: bool = True):
     model.eval()
-    all_logits = []
-    all_y = []
-    for batch in tqdm(loader, desc="val"):
-        pts = batch["points"].to(device)
-        y   = batch["label"].to(device)
-        bidx = batch["batch_idx"].to(device)
+    all_logits, all_y = [], []
+
+    # per-range temperature table
+    rt = cfg.get("range_temperature", {"enable": False})
+    rt_on = bool(rt.get("enable", False))
+    bins  = torch.tensor(rt.get("bins", [0, 15, 30, 45, 60, 1e9]), dtype=torch.float32, device=device)
+    temps = torch.tensor(rt.get("T",   [1.0, 1.0, 1.1, 1.2, 1.3]), dtype=torch.float32, device=device)
+
+    # cache global T once
+    if not hasattr(evaluate, "_temp"):
+        evaluate._temp = maybe_load_temperature(device)
+    T_global = evaluate._temp
+
+    for batch in tqdm(loader, desc="val", mininterval=1.0, smoothing=0.1):
+        pts  = batch["points"].to(device, non_blocking=True)
+        y    = batch["label"].to(device, non_blocking=True)
+        bidx = batch["batch_idx"].to(device, non_blocking=True)
         out = model(pts, bidx)
         logits = out["logits"].reshape(-1) if isinstance(out, dict) else out.reshape(-1)
+
+        # global temperature (from file)
+        if abs(T_global - 1.0) > 1e-6:
+            logits = logits / T_global
+
+        # per-range temperature (piecewise)
+        if rt_on:
+            r = pts[:, -1]  # [N]
+            idx = torch.bucketize(r, bins, right=False).clamp(max=temps.numel()-1)
+            T_r = temps[idx]
+            logits = logits / T_r
+
         all_logits.append(logits.detach().cpu())
         all_y.append(y.cpu())
+
     logits = torch.cat(all_logits, 0)
     y = torch.cat(all_y, 0)
 
@@ -364,7 +505,7 @@ def evaluate(model, loader, device, fixed_thresh: float = 0.5, do_sweep: bool = 
     best = dict(thresh=fixed_thresh, precision=prec_f, recall=rec_f, f1=f1_f, iou_moving=iou_f)
 
     if do_sweep:
-        ths = torch.linspace(0.01, 0.90, steps=30)
+        ths = torch.linspace(0.01, 0.95, steps=60)
         best_f1 = -1.0
         for t in ths:
             st = binary_stats(logits, y, thresh=float(t))
@@ -376,9 +517,14 @@ def evaluate(model, loader, device, fixed_thresh: float = 0.5, do_sweep: bool = 
                 best = dict(thresh=float(t), precision=p, recall=r, f1=f1,
                             iou_moving=st["tp"] / (st["tp"] + st["fp"] + st["fn"] + 1e-8))
 
+    # precision-first sweep (target from env, default 0.80)
+    p_target = float(os.environ.get("MOS_PTARGET", "0.80"))
+    best_p = sweep_for_precision(logits, y, target_p=p_target)
+
     return dict(
         fixed=dict(thresh=fixed_thresh, precision=prec_f, recall=rec_f, f1=f1_f, iou_moving=iou_f),
         best=best,
+        best_for_precision=best_p,
         pred_summary=pred_stats(logits),
         pos_rate=float(y.float().mean().item()),
     )
@@ -396,20 +542,22 @@ def save_checkpoint(out_dir: str, fname: str, payload: dict):
 def init_head_bias_from_prior(model: nn.Module, loader: DataLoader, device, max_batches: int = 8):
     """
     Estimate P(y=1) from a few batches and set final layer bias to logit(P).
-    Works if model has any Linear with out_features=1 in its heads.
+    Works for either Linear(out=1) or Conv2d(out=1).
     """
-    last_lin = None
+    last_head = None
     for m in model.modules():
         if isinstance(m, nn.Linear) and getattr(m, "out_features", None) == 1:
-            last_lin = m
-    if last_lin is None or last_lin.bias is None:
+            last_head = m
+        if isinstance(m, nn.Conv2d) and getattr(m, "out_channels", None) == 1:
+            last_head = m
+    if last_head is None or last_head.bias is None:
         return
 
     total = 0
     pos = 0.0
     iters = 0
     for batch in loader:
-        y = batch["label"].to(device)
+        y = batch["label"].to(device, non_blocking=True)
         pos += float(y.sum().item())
         total += int(y.numel())
         iters += 1
@@ -419,7 +567,7 @@ def init_head_bias_from_prior(model: nn.Module, loader: DataLoader, device, max_
         return
     p = max(1e-5, min(1 - 1e-5, pos / total))
     bias = math.log(p / (1.0 - p))
-    last_lin.bias.data.fill_(bias)
+    last_head.bias.data.fill_(bias)
     print(f"[init] set final bias to prior logit={bias:.4f} (p≈{p:.6f}, from {total} labels)")
 
 
@@ -437,6 +585,12 @@ def main():
     cfg = load_cfg(args.config)
     set_seed(cfg.get("random_seed", 42))
 
+    # Just read TEMPORAL but don't act on it (keeps compatibility)
+    temporal = cfg.get("TEMPORAL", {"enable": False})
+    if temporal.get("enable", False):
+        print("[temporal] NOTE: TEMPORAL.enable is True in config, but the current dataset/model path")
+        print("           uses single-frame + prev context only. Training proceeds without temporal clips.")
+
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda:0")
@@ -444,24 +598,28 @@ def main():
     if device.type == "cuda":
         prop = torch.cuda.get_device_properties(device)
         print(f"[device] name: {prop.name}")
+        # Speed knobs
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # ---------------- model ----------------
-    raw_model = build_model(cfg).to(device)  # always keep an uncompiled base model
+    raw_model = build_model(cfg).to(device)
 
-    # Choose a safe backend for Windows (no Triton needed), and allow override via cfg.
     compile_backend = str(cfg.get("compile_backend", "auto")).lower()
     backend = None
     if compile_backend == "auto":
-        # On Windows, avoid inductor (needs Triton). Use aot_eager instead.
-        backend = "aot_eager" if os.name == "nt" else None  # None => default inductor on Linux
+        backend = "aot_eager" if os.name == "nt" else None
     else:
-        backend = compile_backend  # e.g., "eager", "aot_eager", or "inductor"
+        backend = compile_backend
 
     model_train = raw_model
-    if (device.type == "cuda") and (not args.no_compile):
+    if (device.type == "cuda") and (not args.no_compile) and backend not in ("disabled", "none", "off"):
         try:
             if backend is None:
-                model_train = torch.compile(raw_model)  # default (inductor) on Linux
+                model_train = torch.compile(raw_model)
                 print("[compile] torch.compile enabled (backend=inductor)")
             else:
                 model_train = torch.compile(raw_model, backend=backend)
@@ -476,28 +634,61 @@ def main():
         gamma=cfg["focal_gamma"],
         reduction="mean",
     )
+
+    # BCE (kept for burn-in)
     bce_pos_weight = torch.tensor([cfg["class_weight_moving"]], device=device, dtype=torch.float32)
     bce_loss_none = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight, reduction="none")
 
-    # Optional: instantiate ComboLoss only if available + enabled in cfg
+    # Optional composite loss (enabled via config.combo_loss.enable)
     combo_loss = None
-    if ComboLoss is not None and cfg.get("combo_loss", {}).get("enable", False):
-        cl = cfg["combo_loss"]
-        combo_loss = ComboLoss(**{k: v for k, v in cl.items() if k != "enable"})  # type: ignore
-        print("[loss] Using ComboLoss with params:", cl)
+    cl_cfg = cfg.get("combo_loss", {})
+    if ComboLoss is not None and cl_cfg.get("enable", False):
+        cl_kwargs = {k: v for k, v in cl_cfg.items() if k not in ("enable", "pos_weight")}
+        combo_loss = ComboLoss(pos_weight=cfg["class_weight_moving"], **cl_kwargs)  # type: ignore
+        print("[loss] Using ComboLoss with params:", cl_cfg)
+    else:
+        print("[loss] Using WeightedFocalBCE only")
 
     optim = torch.optim.AdamW(raw_model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler, _ = build_scheduler(optim, cfg)
     ema = EMA(raw_model, decay=float(cfg.get("ema_decay", 0.999))) if cfg.get("ema_enable", False) else None
 
     ds_train, ds_val = make_datasets(cfg)
+
+    # Optional RAM cache (configure via YAML)
+    rcfg = cfg.get("ram_cache", {"enable": True, "max_items": 2000})
+    if rcfg.get("enable", True):
+        ds_train = CachedDataset(ds_train, max_items=rcfg.get("max_items", 2000))
+        ds_val   = CachedDataset(ds_val,   max_items=rcfg.get("max_items_val", 600))
+        print(f"[cache] RAM cache enabled (train≤{rcfg.get('max_items', 2000)}, val≤{rcfg.get('max_items_val', 600)})")
+
+    worker_n = int(cfg["num_workers"])
+    use_workers = (worker_n > 0) and (os.name != "nt")  # disable workers on Windows
+
     dl_train = DataLoader(
-        ds_train, batch_size=cfg["batch_size"], shuffle=True,
-        num_workers=cfg["num_workers"], collate_fn=mos_collate, drop_last=False,
+        ds_train,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        num_workers=(worker_n if use_workers else 0),
+        collate_fn=mos_collate,
+        drop_last=False,
+        pin_memory=False,              # avoid Windows stalls
+        persistent_workers=False,      # force off on Windows
+        timeout=(30 if use_workers else 0),
+        **({"prefetch_factor": 2} if use_workers else {}),
     )
+
     dl_val = DataLoader(
-        ds_val, batch_size=cfg["batch_size"], shuffle=False,
-        num_workers=cfg["num_workers"], collate_fn=mos_collate, drop_last=False,
+        ds_val,
+        batch_size=cfg["batch_size"],
+        shuffle=False,
+        num_workers=(worker_n if use_workers else 0),
+        collate_fn=mos_collate,
+        drop_last=False,
+        pin_memory=False,
+        persistent_workers=False,
+        timeout=(30 if use_workers else 0),
+        **({"prefetch_factor": 2} if use_workers else {}),
     )
 
     if cfg.get("init_prior_bias", True):
@@ -523,7 +714,7 @@ def main():
         use_bce = ep <= burnin_epochs
 
         train_one_epoch(
-            model=model_train,          # compiled wrapper (or raw_model if compile disabled)
+            model=model_train,
             loader=dl_train,
             optim=optim,
             device=device,
@@ -536,19 +727,18 @@ def main():
             use_bce=use_bce,
             combo_loss=combo_loss,
             log_interval=cfg["log_interval"],
-            clip_model=raw_model,       # clip on raw_model params
-            ema_model=raw_model,        # update EMA from raw_model params
+            clip_model=raw_model,
+            ema_model=raw_model,
         )
 
         if scheduler is not None:
             scheduler.step()
 
         if ep % cfg["val_interval_epochs"] == 0:
-            # Evaluate directly on the RAW (uncompiled) model.
             if ema is not None:
                 ema.apply_to(raw_model)
 
-            metrics = evaluate(raw_model, dl_val, device, fixed_thresh=eval_thresh, do_sweep=sweep_eval)
+            metrics = evaluate(raw_model, dl_val, device, cfg, fixed_thresh=eval_thresh, do_sweep=sweep_eval)
 
             if ema is not None:
                 ema.restore(raw_model)
@@ -563,12 +753,20 @@ def main():
                     f"Val (best  t={bs['thresh']:.2f}): P={bs['precision']:.3f} R={bs['recall']:.3f} "
                     f"F1={bs['f1']:.3f} IoU={bs['iou_moving']:.3f}"
                 )
+
+            bp = metrics["best_for_precision"]
+            if bp["thresh"] is not None:
+                print(f"Val (precision≥{int(float(os.environ.get('MOS_PTARGET','0.80'))*100)}%): "
+                      f"t={bp['thresh']:.2f}  P={bp['precision']:.3f} R={bp['recall']:.3f} F1={bp['f1']:.3f}")
+                os.makedirs('checkpoints', exist_ok=True)
+                with open(os.path.join('checkpoints', 'best_threshold.txt'), 'w') as f:
+                    f.write(f"{bp['thresh']:.4f}\n")
+
             print(
                 f"[pred stats] sigmoid mean={ps['mean']:.4f} min={ps['min']:.4f} p10={ps['p010']:.4f} "
                 f"p90={ps['p900']:.4f} max={ps['max']:.4f}  (val pos_rate≈{metrics['pos_rate']:.4f})"
             )
 
-            # Save checkpoints from raw_model weights
             state_to_save = raw_model.state_dict()
             save_checkpoint(
                 "checkpoints",

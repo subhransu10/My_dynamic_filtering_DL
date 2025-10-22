@@ -4,42 +4,51 @@ SEQUENCES_TRAIN: ["00","01","02","03","04","05","06","07","09","10"]
 SEQUENCE_VAL: "08"
 
 # ==== IO / batching ====
-num_workers: 4
-batch_size: 6              # reduce a bit if you raise points
+num_workers: 0            # Windows-safe; avoids DataLoader hangs
+batch_size: 6             # Good starting point for 31 GB; raise to 8 if stable
 max_points: 12288
 use_prev: true
-n_prev: 3                  
-max_prev_points: 80000
+n_prev: 1
+max_prev_points: 60000    # down from 80k to cut BEV memory
+frame_stride: 5
+prev_voxel_size: 0.60
+dmin_chunk: 4096
 
-#speed knobs
-frame_stride: 3        # use every 3rd frame
-prev_voxel_size: 0.6   # downsample prev before dmin
-dmin_chunk: 4096       # GPU chunk for cdist
 # ==== training ====
-epochs: 20
-bce_burnin_epochs: 2
-lr: 1.0e-4
+epochs: 30
+bce_burnin_epochs: 1
+lr: 2.0e-4
 weight_decay: 1.0e-4
 class_weight_moving: 300
 focal_gamma: 2.0
-eval_threshold: 0.81
-eval_sweep: false
-init_prior)bias: true
+eval_threshold: 0.60
+eval_sweep: true
+init_prior_bias: true
 prior_scan_batches: 8
-# LR schedule + warmup
-scheduler: "cosine"        # ["cosine", "none"]
+
+hard_neg:
+  enable: true
+  topk_percent: 2.0      # take top 2% hardest negatives per batch
+  boost: 0.75            # add +75% weight there
+
+ram_cache:
+  enable: true            # helps a lot on Windows HDD/NTFS latency
+  max_items: 2000
+  max_items_val: 600
+
+scheduler: "cosine"
 warmup_epochs: 3
 
 # EMA
 ema_enable: true
 ema_decay: 0.999
 
-# Per-range loss weighting (soft boost for far points)
+# Per-range loss weighting
 range_weight:
   enable: true
-  alpha: 0.5              # up to +50% weight for far pts
-  r0: 20.0                # start boosting after 20m
-  r1: 50.0                # reach max boost at 50m+
+  alpha: 0.5
+  r0: 20.0
+  r1: 50.0
 
 # ==== augmentation ====
 aug:
@@ -57,17 +66,50 @@ random_seed: 42
 semantic_kitti_yaml: null
 
 # --- model switch ---
-model_name: "bev_unet"   # "tiny_mlp" (old) or "me_unet"
+model_name: "bev_resunet"
 
 # BEV grid config (meters)
 bev:
-  voxel_size_xy: 0.20     # BEV cell size (x/y), m
+  voxel_size_xy: 0.12     # a touch coarser to save memory/compute (you can go back to 0.10 later)
   x_min: -50.0
   x_max:  50.0
   y_min: -50.0
   y_max:  50.0
-  base_ch: 32             # BEV UNet width (try 32 → 48 → 64)
+  base_ch: 64             # 64 keeps your 5090 comfy; try 80–96 later if VRAM allows
+  aspp_rates: [1, 6, 12, 18]
 
-# Point feature layout your dataset provides
-# points = [x,y,z,intensity,range,(optional norm_dmin when use_prev=True)]
-use_prev: true            # if true, we assume a 6th channel: norm_dmin
+# Loss combo
+combo_loss:
+  enable: true
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  dice_eps: 1.0e-6
+  label_smooth: 0.02
+  ce_weight: 0.55
+  dice_weight: 0.45
+  aux_weight: 0.20
+
+# compile backend (Windows-safe)
+compile_backend: "eager"   # avoid Inductor/CPP headaches on Win; change to "none" to disable compile
+
+# Deep supervision & dropout
+deep_supervision: true
+dropout: 0.10
+
+selfsup_center:
+  enable: true
+  weight: 0.10           # adds to total loss; 0.05–0.20 is typical
+  target_blur: 7         # pooling size to make soft “center” targets
+
+# NEW: eval-time range-adaptive temperature scaling
+range_temperature:
+  enable: true
+  # piecewise per range (meters) — feel free to tune
+  bins: [0, 15, 30, 45, 60, 1e9]
+  T:    [0.9, 1.0, 1.1, 1.2, 1.3]   # logits /= T(bin)
+
+# NEW (optional): temporal bottleneck (kept OFF for now)
+TEMPORAL:
+  enable: false
+  fuse: "ema"            # ["ema", "max"]
+  decay: 0.7             # for "ema" fusion
